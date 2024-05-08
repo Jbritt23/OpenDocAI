@@ -1,0 +1,166 @@
+import sqlite3      # Used as a database to store user to store data
+import os           # Used to interact with system file system
+import PyPDF2       # Used to extract data from PDF file
+import docx         # Used to extract dat from a Docx file
+import pandas as pd # Used to exctract data from a excel file and could be used fro handling large data sets
+import openai       # This assumes you have the OpenAI library installed
+
+# Path to the configuration file with API key and database
+CONFIG_FILE_PATH = 'config.txt'
+DB_PATH = 'chatgpt_responses.db'
+
+# Default directory for documents (same as the directory of the program)
+DEFAULT_DOCUMENT_DIR = os.getcwd()
+
+def get_api_key(config_file_path: str = CONFIG_FILE_PATH) -> str:
+    """Reads the OpenAI API key from a configuration file."""
+    try:
+        with open(config_file_path, 'r') as file:
+            return file.readline().strip()
+    except FileNotFoundError:
+        print(f"Configuration file not found: {config_file_path}")
+        return ""
+    except Exception as e:
+        print(f"An error occurred while reading the configuration file: {e}")
+        return ""
+
+API_KEY = get_api_key()
+
+def initialize_db():
+    """Initializes the SQLite database and creates the conversations table if it doesn't exist."""
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS conversations
+                     (id INTEGER PRIMARY KEY, user_input TEXT, gpt_response TEXT, conversation_history TEXT)''')
+        conn.commit()
+
+def insert_conversation(user_input: str, gpt_response: str, conversation_history: str):
+    """Inserts a conversation into the database."""
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''INSERT INTO conversations (user_input, gpt_response, conversation_history)
+                     VALUES (?, ?, ?)''', (user_input, gpt_response, conversation_history))
+        conn.commit()
+
+def extract_pdf_data(filepath: str) -> str:
+    """Extracts text from a PDF file."""
+    with open(filepath, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        text = [page.extract_text() for page in reader.pages if page.extract_text() is not None]
+    return ' '.join(text)
+
+def extract_txt_data(filepath: str) -> str:
+    """Extracts text from a TXT file."""
+    with open(filepath, 'r', encoding='utf-8') as file:
+        content = file.read()
+    return content
+
+def extract_doc_data(filepath: str) -> str:
+    """Extracts text from a DOCX file."""
+    doc = docx.Document(filepath)
+    return ' '.join([para.text for para in doc.paragraphs])
+
+def extract_xls_data(filepath: str) -> str:
+    """Extracts data from an XLSX file as a simple string representation."""
+    df = pd.read_excel(filepath)
+    return df.to_string(index=False)
+
+def extract_csv_data(filepath: str) -> str:
+    """Extracts data from a CSV file as a simple string representation."""
+    df = pd.read_csv(filepath)
+    return df.to_string(index=False)
+
+def is_supported_file_type(filepath: str):
+    """Checks if the file type is supported."""
+    supported_types = ['.pdf', '.txt', '.docx', '.xlsx', '.csv']
+    return any(filepath.endswith(ext) for ext in supported_types)
+
+def query_and_store(user_input: str, document_content: str, conversation_history: str):
+    openai.api_key = API_KEY
+    # Condense and prepare the conversation history
+    full_prompt = f"{conversation_history} {document_content} {user_input}".strip()
+
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4-0125-preview",  # Update model as required
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": full_prompt}
+            ],
+            max_tokens=1000
+        )
+        gpt_response = response.choices[0].message["content"].strip()
+    except Exception as e:
+        print(f"An error occurred while querying GPT: {e}")
+        gpt_response = ""
+    
+    new_history = f"{conversation_history}\n{user_input}: {gpt_response}"
+    # Prune history if needed
+    if len(new_history.split()) > 2048:  # Assuming word count approximates token count
+        new_history = prune_history(new_history)  # Define a function to prune history
+
+    insert_conversation(user_input, gpt_response, new_history)
+    print("GPT-4 Response:", gpt_response)
+
+def handle_file_input(document_name: str):
+    """Handles file input based on the document type."""
+    filepath = os.path.join(DEFAULT_DOCUMENT_DIR, document_name)
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found: {document_name}")
+    if filepath.endswith('.pdf'):
+        return extract_pdf_data(filepath)
+    elif filepath.endswith('.txt'):
+        return extract_txt_data(filepath)
+    elif filepath.endswith('.docx'):
+        return extract_doc_data(filepath)
+    elif filepath.endswith('.xlsx'):
+        return extract_xls_data(filepath)
+    elif filepath.endswith('.csv'):
+        return extract_csv_data(filepath)
+    else:
+        raise ValueError("Unsupported file type.")
+
+def estimate_tokens(text: str) -> int:
+    """Estimates the number of tokens in the provided text."""
+    return len(text.split())  # This is a simple estimator based on word count.
+
+
+def main_interaction():
+    """Main user interaction loop."""
+    initialize_db()
+    conversation_history = ""
+    while True:
+        user_choice = input("Do you want to use data from a file? (yes/no/quit): ").strip().lower()
+        if user_choice == 'quit':
+            print("Exiting program.")
+            break
+        elif user_choice == 'yes':
+            document_name = input("Enter the name of your document: ")
+            if is_supported_file_type(document_name):
+                content = handle_file_input(document_name)
+                if content:
+                    while True:  # New loop for continuous document-based questions
+                        user_question = input("Please enter your question about the document (or type 'quit' to exit): ")
+                        if user_question.lower() == 'quit':
+                            break
+                        print(f"Estimated tokens: {estimate_tokens(user_question)}")
+                        query_and_store(user_question, content, conversation_history)
+                        conversation_history += " " + user_question  # Update history
+            else:
+                print("Unsupported file type.")
+        elif user_choice == 'no':
+            while True:  # New loop for continuous general questions
+                user_input = input("Enter your question for the API (or type 'quit' to exit): ")
+                if user_input.lower() == 'quit':
+                    break
+                print(f"Estimated tokens: {estimate_tokens(user_input)}")
+                query_and_store(user_input, "", conversation_history)  # Assuming no document content needed
+                conversation_history += " " + user_input  # Update history
+        else:
+            print("Invalid input, please try again.")
+            
+if __name__ == '__main__':
+    if API_KEY:
+        main_interaction()
+    else:
+        print("API key loading failed. Please check your configuration.")
